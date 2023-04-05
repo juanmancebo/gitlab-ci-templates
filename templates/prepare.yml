@@ -1,0 +1,202 @@
+stages:
+  - prepare
+
+GetContainerBaseImage:
+  stage: prepare
+  image: 
+    name: public.ecr.aws/docker/library/alpine:latest
+  script:
+    - |
+      printenv
+      set -o xtrace
+      #sleep infinity
+      if [ -f gradle.properties ] && [ -f Dockerfile ] ;then
+        export IMAGE=$(grep FROM Dockerfile |tail -1 |awk '{print $2}') ||true
+        if [ -z "${IMAGE}" ];then
+          echo "docker base image not detected. For gradle based projects you need to have a Dockerfile with a base image for jre. Aborting..."
+          exit 1
+        fi
+        if [[ "${IMAGE}" == *"-jre" ]];then
+           echo "jre detected in image. removing it in order to have jdk"
+           export IMAGE=${IMAGE//-jre/}
+        fi
+        echo "Dockerfile contents:"
+        cat Dockerfile
+      elif [ -f gradle.properties ] && [ ! -f Dockerfile ] ;then
+        echo "gradle project withouth Dockerfile. Assuming it's a library"
+        JAVA_VERSION=$(grep -i sourceCompatibility gradle.properties |cut -d = -f2 |cut -d . -f2 |tr -d ' ') ||true
+        if [ -z "${JAVA_VERSION}" ];then
+          echo "Java version not detected. Please configure sourceCompatibility in gradle.properties. Aborting..."
+          exit 1
+        fi
+        export IMAGE=public.ecr.aws/docker/library/amazoncorretto:${JAVA_VERSION}-alpine
+        echo JAVA_VERSION=${JAVA_VERSION} |tee -a prepare.env
+      elif  [ -f package.json ];then
+        apk add jq
+        export NODE_VERSION=$(jq '.engines.node' <package.json |tr -d \~ |tr -d \= |tr -d \") ||true
+        if [ -z "${NODE_VERSION}" ];then
+          echo "Node version not detected in package.json. Please configure engines.node. Aborting..."
+          exit 1
+        elif [[ "${NODE_VERSION}" =~ ">" ]] || [[ "${NODE_VERSION}" =~ "<" ]];then
+          echo "Node version range not supported. Please configure engines.node with a fixed version. Aborting..."
+          exit 1
+        fi
+        export NODE_MAJOR_VERSION=$(echo ${NODE_VERSION} |cut -d . -f1)
+        export IMAGE=public.ecr.aws/docker/library/node:${NODE_VERSION}
+        echo NODE_VERSION=${NODE_VERSION} |tee -a prepare.env
+        echo NODE_MAJOR_VERSION=${NODE_MAJOR_VERSION} |tee -a prepare.env
+      fi
+      echo IMAGE=${IMAGE} |tee -a prepare.env
+  artifacts:
+    reports:
+      dotenv: prepare.env
+
+
+CheckProject:
+  stage: prepare
+  image: 
+    name: registry.gitlab.com/gitlab-org/release-cli
+  ## vault secret dependency. If you don't have vault you can configure it as a gitlab-ci variable (not recommended) 
+  secrets:
+    GITLAB_TOKEN:
+      vault: gitlab/token@gitlab-ci
+      file: false
+  script:
+    - |
+      set -o xtrace
+      if [ -f gradle.properties ] && [ -f package.json ]; then ##pending to review. recursive search
+        echo "Both gradle.properties and package.json detected. Project with multiple technologies aren't supported by this pipeline. Aborting..."
+        exit 1
+      elif [ -f gradle.properties ]; then
+        export PROJECT_TYPE=Gradle
+        export PROJECT_FILE=gradle.properties
+        echo ${PROJECT_TYPE} project detected
+        echo PROJECT_TYPE=${PROJECT_TYPE} >>prepare_vars.env
+        export PROJECT_NAME=$(egrep -i "projectName|project.name" *.gradle |egrep -i 'project.name =|projectname =' |cut -d '=' -f2 |cut -d / -f1 |tr -d \' |tr -d ' ' |tr -d '"')
+        export PRE_RELEASE_VERSION=$(egrep -wi "^version|^projectVersion|^theVersion" gradle.properties|cut -d '=' -f2|tr -d ' ')
+        if [ ! -f Dockerfile ];then
+          echo "gradle project withouth Dockerfile. Assuming it's a library"
+          echo JAVA_LIBRARY=true |tee -a prepare_vars.env
+        fi
+      elif [ -f package.json ] ;then
+        export PROJECT_TYPE=Npm
+        echo ${PROJECT_TYPE} project detected
+        echo PROJECT_TYPE=${PROJECT_TYPE} >>prepare_vars.env
+        time apk add npm
+        export PACKAGE_NAME=$(node -p "require('./package.json').name")
+        export NPM_GROUP_NAME=$(echo ${PACKAGE_NAME} |cut -d / -f1)
+        export PROJECT_NAME=$(echo ${PACKAGE_NAME} |cut -d / -f2)
+        export PRE_RELEASE_VERSION=$(node -p "require('./package.json').version")
+        if [ -f package.json ] && [ ! -f npm-shrinkwrap.json ] && [ ! -f package-lock.json ];then
+          export PROJECT_FILE="package.json"
+        elif [ -f package.json ] && [ -f npm-shrinkwrap.json ] ;then
+          export PROJECT_FILE="package.json npm-shrinkwrap.json"
+        elif [ -f package.json ] && [ -f package-lock.json ] ;then
+          export PROJECT_FILE="package.json package-lock.json"
+        fi
+      else
+        echo "No gradle.properties, package.json,package-lock.json or npm-shrinkwrap.json detected. Aborting..."
+        exit 1
+      fi
+      if [ -z "${PROJECT_NAME}" ]; then
+        echo "Project name not detected. Aborting..."
+        exit 1
+      else
+        echo "Project name detected: ${PROJECT_NAME}"
+        echo PROJECT_NAME=${PROJECT_NAME} >> prepare_vars.env
+        echo NPM_GROUP_NAME=${NPM_GROUP_NAME} >> prepare_vars.env
+      fi
+      ## check pre-release
+      if [ "${CI_COMMIT_REF_NAME}" != "${CI_DEFAULT_BRANCH}" ];then
+        if [ -z "${PRE_RELEASE_VERSION}" ] || [[ "${PRE_RELEASE_VERSION}" != *"-SNAPSHOT" ]];then
+          echo "pre-release version not detected. Aborting..."
+          exit 1
+        else
+          ## check pre-release in all project files
+          #PROJECT_FILE_COUNT=$(echo ${PROJECT_FILE} |wc -w)
+          #if [ $(grep -qs "${PRE_RELEASE_VERSION}" ${PROJECT_FILE}) |wc -l) -ne "${PROJECT_FILE_COUNT}" ];then
+          #  echo "review version "${PRE_RELEASE_VERSION}" is configured in all your project files"
+          echo PRE_RELEASE_VERSION=${PRE_RELEASE_VERSION} |tee -a prepare_vars.env
+        fi
+      fi
+      ## check release
+      export RELEASE_VERSION=${PRE_RELEASE_VERSION%\-SNAPSHOT}
+      if [ -z "${RELEASE_VERSION}" ]; then
+        echo "Release version not detected. Aborting..."
+        exit 1
+      else
+        echo RELEASE_VERSION=${RELEASE_VERSION} |tee -a prepare_vars.env
+      fi
+      ## check if release already exists
+      RELEASE_OUTPUT=$(release-cli get --tag-name ${RELEASE_VERSION}) || true
+      if [ ! -z "${RELEASE_OUTPUT}" ]
+      then
+        echo "release ${RELEASE_VERSION} already exists. project version was not bumped in your project file or release was created outside this pipeline"
+        echo "Aborting..."
+        exit 1
+      fi
+      ##Branching model checks
+      if [ "${CI_DEFAULT_BRANCH}" != "master" ] && [ "${CI_DEFAULT_BRANCH}" != "main" ] || [ "${CI_PIPELINE_SOURCE}" == "merge_request_event" ] && [ "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" != "${CI_DEFAULT_BRANCH}" ];then
+        echo "This pipeline only supports feature branching model with master or main as default branches. Aborting..."
+        exit 1
+      fi
+      ## Modify pre-release to release when merged to default branch
+      if [[ "$CI_COMMIT_MESSAGE" =~ "^Merge branch " ]] && [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]] && [[ "$CI_COMMIT_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]];then
+        echo "Updating version in ${PROJECT_FILE}"
+        #NPM
+        if [ "${PROJECT_TYPE}" == "Npm" ];then
+          npm version --no-commit-hooks --no-git-tag-version ${RELEASE_VERSION}
+        fi
+        #GRADLE
+        if [ "${PROJECT_TYPE}" == "Gradle" ];then
+          sed -i "s/${PRE_RELEASE_VERSION}/${RELEASE_VERSION}/g" ${PROJECT_FILE}
+        fi
+        apk add git
+        git remote set-url origin "https://${GITLAB_REPO_USER}:${GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+        git config user.email "${GITLAB_USER_EMAIL}"
+        git config user.name "${GITLAB_USER_NAME}"
+        git add ${PROJECT_FILE}
+        git commit -m "[ci skip] update ${PROJECT_FILE}: ${PRE_RELEASE_VERSION} => ${RELEASE_VERSION}"
+        git push origin HEAD:${CI_COMMIT_REF_NAME}
+      fi
+  artifacts:
+    paths:
+      - "gradle.properties"
+      - "package.json"
+      - "package-lock.json"
+      - "npm-shrinkwrap.json"
+    reports:
+      dotenv: prepare_vars.env
+
+CheckSemver:
+  stage: prepare
+  needs: [CheckProject]
+  image: 
+    name: public.ecr.aws/docker/library/golang:alpine
+  script:
+    - CGO_ENABLED=0 GOOS=linux go install -ldflags '-extldflags "-static" -w -s' github.com/google/go-containerregistry/cmd/crane@latest
+    - mv $(which crane) .
+    - |
+      cat > /tmp/semver.go << "EOF"
+      package main
+      import (
+          "regexp"
+          "os"
+          "fmt"
+      )
+      func main() {
+          var re = regexp.MustCompile(`(?m)^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
+          var RELEASE_VERSION=os.Getenv("RELEASE_VERSION")
+          if re.MatchString(RELEASE_VERSION) {
+                fmt.Println(RELEASE_VERSION, "is semver")
+          } else {
+                fmt.Println(RELEASE_VERSION, "is not a valid semver. Aborting...")
+                os.Exit(1)
+                }
+      }
+      EOF
+    - cat /tmp/semver.go
+    - go run /tmp/semver.go
+  artifacts:
+    paths:
+      - "crane"

@@ -1,0 +1,141 @@
+variables:
+  CONTAINER_IMAGE_NAME: "${CONTAINER_REGISTRY_BASE_URL}/${CI_PROJECT_NAME}"
+  NPM_CONFIG_USERCONFIG: "${CI_PROJECT_DIR}.tmp/NPMRC_PROXY"
+  NPM_CONFIG_CACHE: "${CI_PROJECT_DIR}/.npm"
+
+stages:
+  - build
+  - build_container
+
+buildGradle:
+  stage: build
+  image: 
+    name: ${IMAGE}
+  script:
+    - ./gradlew --build-cache assemble -I $INIT_GRADLE
+    - |
+      SRC_PATH=$(find -name src -type d)
+      if [ ! -z ${SRC_PATH} ];then
+        if [[ "${JAVA_LIBRARY}" == "true" ]];then
+          export ARTIFACT_PATH=$(find -name build -type d -print0| xargs -0 -I{} find '{}' -type f -name "*.jar" -not -name "*sources.jar")
+        else
+      	  export ARTIFACT_PATH=$(find -name build -type d -print0| xargs -0 -I{} find '{}' -type f -name "*.tar" -o -name "*.tgz" -o -name "*.tar.gz" -o -name "*.zip" -o -name "*.war")
+        fi
+      	ARTIFACT_COUNT=$(echo "${ARTIFACT_PATH}" |wc -l)
+      	if [ -z "${ARTIFACT_PATH}" ];then
+      	  echo "artifact file not detected. Aborting..."
+      	  exit 1
+      	elif [ "${ARTIFACT_COUNT}" -gt 1 ];then
+      	 echo "detected ${ARTIFACT_COUNT} artifacts. This pipeline only supports one. Aborting..."
+      	 exit 1
+      	fi
+      	echo ARTIFACT_PATH=${ARTIFACT_PATH} |tee -a >>build_vars.env
+      	echo ARTIFACT=$(basename ${ARTIFACT_PATH}) |tee -a >>build_vars.env
+      else
+        echo "src folder not found in this project"
+      fi
+    - |
+      GRADLE_PROJECTS_OUTPUT=$(./gradlew projects -I $INIT_GRADLE)
+      echo "${GRADLE_PROJECTS_OUTPUT}"
+      GRADLE_PROJECTS=$(echo "${GRADLE_PROJECTS_OUTPUT}" |grep 'Root project' -A10 |egrep -w 'Root project|\--- Project' |sort -u)
+      echo GRADLE_PROJECTS="${GRADLE_PROJECTS}"
+      GRADLE_PROJECTS_COUNT=$(echo "${GRADLE_PROJECTS}" |wc -l)
+      if [ ${GRADLE_PROJECTS_COUNT} -gt 1 ];then
+        echo MULTI_PROJECT=true |tee -a >>build_vars.env
+      fi
+      export JAVAC_VERSION=$(javac -version 2>&1 |awk '{print $2}')
+      if [[ "${JAVAC_VERSION}" =~ "^1.8" ]];then
+        export JAVA_MAJOR_VERSION=$(echo ${JAVAC_VERSION} |cut -d '.' -f2)
+      else
+        export JAVA_MAJOR_VERSION=$(echo ${JAVAC_VERSION} |cut -d '.' -f1)
+      fi
+      echo JAVA_MAJOR_VERSION=${JAVA_MAJOR_VERSION} |tee -a build_vars.env
+      echo SNYK_IMAGE=snyk/snyk:gradle-jdk${JAVA_MAJOR_VERSION} |tee -a build_vars.env
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    policy: push
+    paths:
+      - build
+      - .gradle
+  artifacts:
+    paths:
+      - '**/build/*/*.pom'
+      - '**/build/*/*.jar'
+      - '**/build/*/*.war'
+      - '**/build/*/*.tar'
+      - '**/build/*/*.tar.gz'
+      - '**/build/*/*.tgz'
+      - '**/build/*/*.zip'
+      - '**/build/*/${CI_PROJECT_NAME}'
+    expire_in: 1 week
+    reports:
+      dotenv: build_vars.env
+  rules:
+    - exists:
+        - gradle.properties
+
+buildNpm:
+  stage: build
+  image: 
+    name: ${IMAGE}
+  before_script:
+    - cp "$NPMRC" "$NPM_CONFIG_USERCONFIG"
+      #Needed when project version is updated in package.json but not in lock files
+    - npm i --package-lock-only
+    - npm ci
+  script:
+    - npm run build
+    - npm pack
+    - |
+      ARTIFACT_NAME="$(node -p "require('./package.json').name" |sed 's/@//' |sed 's/\//-/')"
+      export ARTIFACT_PATH="./${ARTIFACT_NAME}"
+      export ARTIFACT_PATH=$(find -maxdepth 1 -type f -name "${ARTIFACT_NAME}-*.tgz")
+      ARTIFACT_COUNT=$(echo "${ARTIFACT_PATH}" |wc -l)
+      if [ -z "${ARTIFACT_NAME}" ];then
+        echo "artifact file not detected. Aborting..."
+        exit 1
+      elif [ "${ARTIFACT_COUNT}" -gt 1 ];then
+       echo "detected ${ARTIFACT_COUNT} artifacts. This pipeline only supports one. Aborting..."
+       exit 1
+      fi
+      echo ARTIFACT_PATH=${ARTIFACT_PATH} |tee -a build_vars.env
+      echo ARTIFACT=$(basename ${ARTIFACT_PATH}) |tee -a build_vars.env
+      echo SNYK_IMAGE=snyk/snyk:node-${NODE_MAJOR_VERSION} |tee -a build_vars.env
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .npm
+      - node_modules
+  artifacts:
+    reports:
+      dotenv: build_vars.env
+    paths:
+      - dist/
+      - node_modules/
+      - '*.tgz'  
+      - 'package-lock.json' #Needed when project version is updated in package.json but not in lock files
+      - 'npm-shrinkwrap.json' #Needed when project version is updated in package.json but not in lock files
+  rules:
+    - exists:
+        - package.json
+
+buildContainer:
+  stage: build_container
+  image: 
+    name: gcr.io/kaniko-project/executor:debug
+  before_script:
+    - cat Dockerfile
+    - ls -lah
+  script:
+    - /kaniko/executor --context "${CI_PROJECT_DIR}" --dockerfile "${CI_PROJECT_DIR}/Dockerfile" --no-push --destination ${CONTAINER_IMAGE_NAME} --tarPath "image.tar"
+    #workaround issue multi-stage build with artifacts. https://gitlab.com/gitlab-org/gitlab-runner/-/issues/29587. Until this MR is released https://gitlab.com/gitlab-org/gitlab-runner/-/merge_requests/3897 in gitlab-runner 15.10
+    - mkdir /workspace ||true
+  after_script:
+    - ls -lah image.tar
+  artifacts:
+    paths:
+      - "image.tar"
+    when: on_success
+  rules:
+    - exists:
+        - Dockerfile

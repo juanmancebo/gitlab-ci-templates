@@ -1,0 +1,19 @@
+stages:
+  - prepare
+  - build
+  - build_container
+  - test
+  - security
+  - publish
+  - release
+
+include: 
+  - /templates/workflow.yml
+  - /templates/prepare.yml
+  - /templates/build.yml
+  - /templates/test.yml
+  - /templates/security.yml
+  - /templates/publish.yml
+  - /templates/release.yml
+
+    

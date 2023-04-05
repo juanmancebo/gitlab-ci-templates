@@ -1,0 +1,76 @@
+##pending to review nexus publish conditions
+NexusGradle:
+  stage: publish
+  image:
+    name: ${IMAGE}
+  script:
+    - ./gradlew publish --info -I $INIT_GRADLE
+  rules:
+    - exists:
+        - gradle.properties
+
+NexusNpm:
+  stage: publish
+  image:
+    name: ${IMAGE}
+  before_script:
+    - cp "$NPMRC" "$NPM_CONFIG_USERCONFIG"
+    - |
+      if [ "${SNAPSHOT}" == "true" ];then
+        npm config set ${NPM_GROUP_NAME}:registry ${NPM_REPO_SNAPSHOT}
+      fi
+    - cat "$NPM_CONFIG_USERCONFIG"
+  script:
+    - npm publish
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^Merge branch / && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_BEFORE_SHA != "0000000000000000000000000000000000000000"
+      exists:
+        - package.json
+      variables:
+        SNAPSHOT: "false"
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_MERGE_REQUEST_IID
+      exists:
+        - package.json
+      variables:
+        SNAPSHOT: "true"
+
+S3:
+  stage: publish
+  image: 
+    name: public.ecr.aws/aws-cli/aws-cli:latest
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - aws s3 cp ${ARTIFACT_PATH} s3://${S3_BUCKET_NAME}/${PROJECT_NAME}/${RELEASE_VERSION}/${ARTIFACT} --acl bucket-owner-full-control
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^Merge branch / && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_BEFORE_SHA != "0000000000000000000000000000000000000000"
+      exists:
+        - Dockerfile #Avoid to upload libraries. Pending to review.
+
+Container:
+  stage: publish
+  image: 
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - echo '{"credsStore":"ecr-login"}' > /kaniko/.docker/config.json
+  script:
+    - mv crane /kaniko
+    - cd /kaniko
+    - time ./crane push "${CI_PROJECT_DIR}/image.tar" "${CONTAINER_IMAGE_NAME}:${CONTAINER_IMAGE_TAG}"
+    - time ./crane push "${CI_PROJECT_DIR}/image.tar" "${CONTAINER_IMAGE_NAME}:${CONTAINER_IMAGE_TAG_2}"
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^Merge branch / && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_BEFORE_SHA != "0000000000000000000000000000000000000000"
+      variables:
+        CONTAINER_IMAGE_TAG: "${RELEASE_VERSION}"
+        CONTAINER_IMAGE_TAG_2: "latest"
+      exists:
+        - Dockerfile
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_MERGE_REQUEST_IID
+      variables:
+        CONTAINER_IMAGE_TAG: "${CI_COMMIT_REF_SLUG}"
+        CONTAINER_IMAGE_TAG_2: "${CI_COMMIT_REF_SLUG}_${CI_COMMIT_SHORT_SHA}"
+      exists:
+        - Dockerfile

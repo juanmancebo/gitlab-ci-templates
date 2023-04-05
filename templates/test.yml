@@ -1,0 +1,86 @@
+variables:
+  JACOCO_REPORT_PATH: "build/reports/jacoco/test"
+  JUNIT_REPORT_PATH: "build/test-results/test"
+  JACOCO_REPORT: "${JACOCO_REPORT_PATH}/html/index.html"
+  MYSQL_TEST_PROPERTIES: "src/test/resources/secure.properties"
+
+stages:
+  - test
+
+#commented until the issue https://gitlab.com/gitlab-org/gitlab/-/issues/386040 is resolved
+#include:    
+#  - local: /templates/test_mysql.yml
+#    rules:
+#      - if: ${MYSQL_TEST_PROPERTIES} 
+
+TestGradle:
+  stage: test
+  needs: [GetContainerBaseImage,buildGradle]
+  variables:
+    MYSQL_ROOT_PASSWORD: 'mySQLr00tPassword'
+    MYSQL_VERSION: '8.0'
+  services:
+    - public.ecr.aws/docker/library/mysql:${MYSQL_VERSION}
+  image: 
+    name: ${IMAGE}
+  before_script:
+    - |
+      GU_PATH=$(command -v gu || true) #workaround to add js support to most recent graalvm images
+      if [ ! -z ${GU_PATH} ];then
+        ${GU_PATH} install js
+      fi
+    - | 
+      if [ -f ${MYSQL_TEST_PROPERTIES} ];then #Dependency test_mysql.yml
+        sed -i "s/jdbc.password  =/jdbc.password  = ${MYSQL_ROOT_PASSWORD}/g" ${MYSQL_TEST_PROPERTIES}
+      fi
+  script:
+    - ./gradlew check -I $INIT_GRADLE
+  after_script:
+    - |
+      if [ -f "${JACOCO_REPORT}" ];then
+        grep -o 'Total[^%]*%' ${JACOCO_REPORT}
+      fi
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - build
+      - .gradle
+    policy: pull
+  artifacts:
+    when: always
+    paths:
+      - ${JACOCO_REPORT_PATH}
+      - ${JUNIT_REPORT_PATH}
+      - "*/build/reports/tests/test/index.html"
+      - "build/reports/*"
+      - "*/buld/reports/*"
+    reports:
+      junit: ${JUNIT_REPORT_PATH}/*.xml
+  coverage: '/Total.*?([0-9]{1,3})%/'
+  rules:
+    - exists:
+        - '{src/test/*,src/test/*/*,*/src/test/*,*/*/src/test/*,*/src/test/*/*,*/*/src/test/*/*}'
+        - '{test/*,test/*/*}'
+  allow_failure: false
+
+TestNpm:
+  stage: test
+  needs: [GetContainerBaseImage,buildNpm]
+  image: 
+    name: ${IMAGE}
+  script:
+    - npm run test
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+      - test-report.xml
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml #Go to Settings > CI/CD > Test coverage parsing and put this regex:Lines\s*:\s*(\d+.?\d*)%      
+      junit:
+        - junit.xml
+  rules:
+    - exists:
+        - src/components/test/*

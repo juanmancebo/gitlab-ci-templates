@@ -1,0 +1,144 @@
+stages:
+  - security
+
+secretDetection:
+  stage: security
+  needs: []
+  variables:
+    #GITLEAKS_CONFIG:
+  image: 
+    name: zricethezav/gitleaks:latest
+    entrypoint: [""]
+  script: gitleaks detect -v --no-git #--log-opts="--all $CI_COMMIT_SHA $CI_COMMIT_BEFORE_SHA"
+  allow_failure: false
+
+Sonar:
+  stage: security
+  image: 
+    name: sonarsource/sonar-scanner-cli:latest
+  variables:
+    GIT_DEPTH: "0"
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  before_script:
+    - |
+      set -o xtrace
+      if [ "${PROJECT_TYPE}" == "Gradle" ];then
+        SONAR_SOURCES=$(find -maxdepth 2 -type d -name src -print0| xargs -0 -I{} find '{}' -maxdepth 1 -type d -name main -print0| xargs -0 -I{} find '{}' -maxdepth 1 -type d -name java |tr '\n' ',' | sed 's/.$//')
+        SONAR_JAVA_BINARIES=$(find -maxdepth 2 -type d -name build |tr '\n' ',' | sed 's/.$//')
+        SONAR_TESTS=$(find -maxdepth 2 -type d -name src -print0| xargs -0 -I{} find '{}' -maxdepth 1 -type d -name test |tr '\n' ',' | sed 's/.$//')
+        export SONAR_SCANNER_OPTS="-Dsonar.projectKey=${PROJECT_NAME} -Dsonar.projectName=${PROJECT_NAME} -Dsonar.projectVersion=${RELEASE_VERSION} -Dsonar.sources=${SONAR_SOURCES} -Dsonar.tests=${SONAR_TESTS} -Dsonar.java.binaries=${SONAR_JAVA_BINARIES} -Dsonar.junit.reportPaths=${JUNIT_REPORT_PATH} -Dsonar.coverage.jacoco.xmlReportPaths=${JACOCO_REPORT_PATH}"
+      fi
+  script:
+    - sonar-scanner -Dsonar.qualitygate.wait=true
+  cache:
+    key: ${CI_JOB_NAME}
+    paths:
+      - .sonar/cache
+  rules:
+    - exists:
+        - '{src/test/*,src/test/*/*,*/src/test/*,*/*/src/test/*,*/src/test/*/*,*/*/src/test/*/*}'
+        - '{test/*,test/*/*}'
+        - src/components/test/* 
+  allow_failure: false
+
+Snyk:
+  stage: security
+  image: 
+    name: ${SNYK_IMAGE}
+  script:
+    - set -o xtrace
+    - |
+      if [[ $MULTI_PROJECT == "true" ]];then 
+        export SNYK_ALL_PROJECTS_PARAM="--all-projects"
+      else
+        export SNYK_SINGLE_PROJECT_PARAM="--project-name=${PROJECT_NAME}"
+      fi
+    - snyk config set disable-analytics=1
+    - |
+      { SNYK_TEST_EXIT_CODE=0; snyk test --init-script=$INIT_GRADLE ${SNYK_SINGLE_PROJECT_PARAM} ${SNYK_ALL_PROJECTS_PARAM} --severity-threshold=${SNYK_THRESHOLD} --json || SNYK_TEST_EXIT_CODE=$?; } > >(tee snyk_results.json)
+      echo SNYK_TEST_EXIT_CODE=${SNYK_TEST_EXIT_CODE}
+      if [ ${SNYK_TEST_EXIT_CODE} -eq 1 ];then
+        echo "Downloading snyk-to-html"
+        curl -s https://api.github.com/repos/snyk/snyk-to-html/releases/latest | egrep -i "browser_download_url.*-linux\"" | cut -d : -f 2,3 | tr -d \" | wget --quiet -O snyk-to-html -i -
+        chmod +x snyk-to-html
+        ./snyk-to-html -i snyk_results.json -o snyk_results.html -a
+        echo "action_needed, vulns found. You can see results in ${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/file/snyk_results.html"
+        echo "Aborting..."
+        exit ${SNYK_TEST_EXIT_CODE}
+      fi
+    - |
+      if [[ "${SNYK_MONITOR}" == "true" ]];then 
+        export GITLAB_ORG=$(echo ${PROJECT_NAMESPACE} | awk -F '/' '{print $NF}')
+        snyk auth ${SNYK_TOKEN}
+        export GITLAB_ORG=$(echo $CI_PROJECT_NAMESPACE | awk -F '/' '{print $NF}')
+        export ORG_NAME=$(snyk test --org=snyk --dummy parameter|grep "following orgs:" |egrep -o "${GITLAB_ORG}|${GITLAB_ORG}-[a-z0-9][a-z0-9][a-z0-9]") ||true
+        if [ -z "${ORG_NAME}" ];then
+          echo "Organization name not detected in Snyk searching by ${GITLAB_ORG}. Aborting..."
+          exit 1
+        fi
+        export VERSION=$(echo ${RELEASE_VERSION} |tr '.' '-')
+        snyk monitor --init-script=$INIT_GRADLE --org=${ORG_NAME} ${SNYK_SINGLE_PROJECT_PARAM} ${SNYK_ALL_PROJECTS_PARAM} --json --target-reference=${CI_COMMIT_REF_NAME} --project-tags=CI_JOB_ID=${CI_JOB_ID},VERSION=${VERSION}
+      fi
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - build
+      - .gradle
+    policy: pull
+  artifacts:
+    when: on_failure
+    paths:
+      - "snyk_results.html"
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^Merge branch / && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_BEFORE_SHA != "0000000000000000000000000000000000000000"
+      variables:
+        SNYK_MONITOR: "true"
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_MERGE_REQUEST_IID
+      variables:
+        SNYK_MONITOR: "false"
+  allow_failure: false
+
+
+Trivy:
+  stage: security
+  needs: [buildContainer]
+  image: 
+    name: public.ecr.aws/aquasecurity/trivy:latest
+    entrypoint: [""]
+  variables:
+    # No need to clone the repo, we exclusively work on artifacts.  See
+    # https://docs.gitlab.com/ee/ci/runners/README.html#git-strategy
+    GIT_STRATEGY: none
+  before_script:
+    - export TRIVY_VERSION=$(trivy --version |grep -w "^Version:" |awk '{print $2}')
+    - echo "TRIVY_VERSION=${TRIVY_VERSION}"
+    - echo "TRIVY_SEVERITY=${TRIVY_SEVERITY}"
+    - wget --directory-prefix=/tmp https://github.com/aquasecurity/trivy/raw/v${TRIVY_VERSION}/contrib/gitlab-codequality.tpl
+  script:
+    # Scan vulnerabilities that came from base image
+    - time trivy --cache-dir .trivycache/ image --ignore-unfixed --exit-code 0 --vuln-type os --no-progress --format template --template "@/tmp/gitlab-codequality.tpl" --output "$CI_PROJECT_DIR/gl-codeclimate.json" --input image.tar
+    - time trivy --cache-dir .trivycache/ image --ignore-unfixed --exit-code 0 --vuln-type os --no-progress --input image.tar --skip-dirs /opt/${PROJECT_NAME}
+    - time trivy --cache-dir .trivycache/ image --ignore-unfixed --exit-code 0 --vuln-type os --no-progress --input image.tar --skip-dirs /opt/${PROJECT_NAME} --format json --output "${CI_PROJECT_DIR}/container-scanning-base-report.json"
+    # Scan vulnerabilities final image
+    - time trivy --cache-dir .trivycache/ image --ignore-unfixed --exit-code 0 --no-progress --input image.tar
+    - time trivy --cache-dir .trivycache/ image --ignore-unfixed --exit-code 1 --no-progress --input image.tar --format json --output "${CI_PROJECT_DIR}/container-scanning-final-report.json"
+  after_script:
+    - apk add jq
+    - echo "CONTAINER BASE IMAGE SCANNING SUMMARY:"
+    - echo "Severity  PkgName  PkgPath  InstalledVersion  FixedVersion" && jq '.Results[].Vulnerabilities[]? |"\(.Severity)  \(.PkgName)  \(.PkgPath)  \(.InstalledVersion)  \(.FixedVersion)"' < container-scanning-base-report.json |sort -rk3 -u
+    - echo "CONTAINER FINAL IMAGE SCANNING SUMMARY:"
+    - echo "Severity  PkgName  PkgPath  InstalledVersion  FixedVersion" && jq '.Results[].Vulnerabilities[]? |"\(.Severity)  \(.PkgName)  \(.PkgPath)  \(.InstalledVersion)  \(.FixedVersion)"' < container-scanning-final-report.json |sort -rk3 -u
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    when: always
+    paths:
+      - gl-codeclimate.json #Enables code quality merge request widget. https://docs.gitlab.com/ee/ci/testing/code_quality.html#merge-request-widget
+      - container-scanning-final-report.json
+    reports:
+      codequality: gl-codeclimate.json
+  allow_failure: false
+  rules:
+    - exists:
+        - Dockerfile

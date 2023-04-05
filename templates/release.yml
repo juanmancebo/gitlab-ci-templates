@@ -1,0 +1,21 @@
+stages:
+  - release
+
+Release:
+  stage: release
+  image: 
+    name: registry.gitlab.com/gitlab-org/release-cli
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - >
+      release-cli create --name "${PROJECT_NAME} ${RELEASE_VERSION}" --description "${PROJECT_NAME} release ${RELEASE_VERSION}"
+      --tag-name ${RELEASE_VERSION} --ref $CI_COMMIT_SHA
+      --assets-link '{"name":"artifact","url":"'${CI_PROJECT_URL}'/-/jobs/'${CI_JOB_ID}'/artifacts/file/'${ARTIFACT_PATH}'","link_type":"other"}'
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^Merge branch / && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  artifacts:
+    paths:
+      - '${ARTIFACT_PATH}'
+    expire_in: never
+

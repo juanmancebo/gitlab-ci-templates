@@ -1,0 +1,7 @@
+TestGradle:
+  variables:
+    MYSQL_ROOT_PASSWORD: 'mySQLr00tPassword'
+    MYSQL_VERSION: '8.0'
+  services:
+    - public.ecr.aws/docker/library/mysql:${MYSQL_VERSION}
+
